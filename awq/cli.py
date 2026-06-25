@@ -15,6 +15,27 @@ from typing import Any
 # when a subcommand actually needs them.
 
 
+def _warn_if_cuda_mismatch(requested_device: str | None) -> str | None:
+    """Check if the requested device is available; warn if not.
+
+    Returns the resolved device string (may fall back to auto-detect).
+    """
+    if requested_device == "cuda":
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                print("[WARN] --device cuda requested but CUDA is not available.")
+                print("       Install PyTorch with CUDA support:")
+                print("       pip install torch --index-url https://download.pytorch.org/whl/cu121")
+                fallback = "mps" if torch.backends.mps.is_available() else "cpu"
+                print(f"       Falling back to {fallback}.")
+                return fallback
+        except ImportError:
+            print("[WARN] torch not importable. Falling back to cpu.")
+            return "cpu"
+    return requested_device
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -524,6 +545,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+
+    # Warn if user asked for CUDA but it's not available
+    if hasattr(args, 'device') and args.device:
+        args.device = _warn_if_cuda_mismatch(args.device)
 
     try:
         if args.command == "calibrate":

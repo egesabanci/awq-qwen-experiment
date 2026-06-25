@@ -32,10 +32,13 @@ def load_fp16_model(
         device = get_device()
 
     print(f"Loading model from {model_path}...")
+    # device_map="auto" for CUDA (best for single/multi GPU),
+    # device string for MPS/CPU directly
+    device_map = "auto" if device == "cuda" else device
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
-        device_map=device,
+        device_map=device_map,
         trust_remote_code=False,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
