@@ -1,40 +1,50 @@
-# AWQ Qwen Experiment Technical Documentation
+# awq — Technical Documentation
 
-This directory contains maintainer-focused reference documentation for the
-AWQ quantization pipeline. It describes the behavior implemented in
-`awq/`, `eval/`, `data/`, and `utils/`.
+Maintainer-focused reference documentation for `awq`, a model-agnostic
+Activation-aware Weight Quantization (AWQ) CLI implemented in pure PyTorch.
 
 The pipeline is deliberately linear:
 
 ```txt
-calibrate → scales → quantize → benchmark
+calibrate → scales → quantize (+ verify)
 ```
 
-The package is also import-light. Importing `awq` or its CLI must not import
+The package is import-light: importing `awq` or running the CLI does not import
 `torch`, `transformers`, or `datasets` until the subcommand that needs them
-executes.
+executes. `awq --help` is instant and side-effect-free.
 
 ## Documentation Map
 
 | Document | Purpose |
 | --- | --- |
 | [Pipeline](pipeline.md) | End-to-end execution flow and phase responsibilities. |
-| [Architecture](architecture.md) | Module boundaries, dependency timing, data flow, and invariants. |
+| [Architecture](architecture.md) | Module boundaries, dependency timing, data flow, invariants. |
 | [CLI](cli.md) | Command-line reference with examples and failure behavior. |
 | [Calibration](calibration.md) | Activation statistics collection, hooks, memory efficiency. |
-| [AWQ Scales](quantization.md) | Scale formula, strategy options, and layer skipping. |
-| [INT4 Quantization](quantization.md) | Memory-safe quantizer, packing format, reconstruction quality. |
-| [Inference](inference.md) | Dequantization, weight injection, and memory-efficient wrapper. |
-| [Benchmark](benchmark.md) | FP16 vs AWQ comparison methodology and metrics. |
+| [Quantization](quantization.md) | AWQ scale search, skip strategies, INT4 packing, reconstruction. |
+| [Inference](inference.md) | Dequantization, weight injection, and the memory-efficient wrapper. |
 | [EC2 Deployment](ec2.md) | Installation and usage on AWS EC2 with CUDA GPUs. |
 | [Development](development.md) | Test commands, import-safety checks, and extension workflow. |
 
-## Supported Models
+## What `awq` is (and is not)
 
-| Model | Architecture | AWQ Status |
-| --- | --- | --- |
-| Qwen3.5-2B | 24-layer dense, mixed linear + full attention | Full pipeline tested. INT4 quality loss severe. |
-| Qwen3-4B | Dense | FP16 partially downloaded. |
+`awq` quantizes the linear layers of a Hugging Face causal LM to group-wise
+INT4 with per-channel AWQ scaling, and verifies the result by reconstruction.
+
+It is **not** an INT4 inference engine. Loading the quantized artifact
+(`awq.inference.load_awq_model`) dequantizes weights back to FP16 and runs a
+standard forward — useful for sanity-checking quality, but there is no INT4
+kernel, so no inference speed/memory win. Hand the artifact to an INT4-aware
+runtime (vLLM, TGI, MLX, TensorRT-LLM) for real INT4 execution. See
+[inference.md](inference.md).
+
+## Model compatibility
+
+Works on any HF causal LM whose transformer linears are named
+`model.layers.{i}.*` (Llama/Qwen/Mistral convention). `build_skip_set` derives
+the layer count from the calibration stats, so depth-dependent strategies
+(`alternating`, `last_only`, `first_only`) adapt automatically. `lm_head` is
+skipped by default.
 
 ## Quick Maintainer Commands
 

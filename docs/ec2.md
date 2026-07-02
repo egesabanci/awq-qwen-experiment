@@ -1,158 +1,136 @@
 # EC2 Deployment
 
-Install and run the AWQ quantization pipeline on AWS EC2 with CUDA GPUs.
+Install and run `awq` on AWS EC2 with NVIDIA GPUs. CUDA is where you can
+calibrate and quantize larger models (7B+) that don't fit comfortably on a
+laptop, and where you'd later hand the quantized artifact to an INT4-aware
+runtime for real INT4 execution.
 
 ## Prerequisites
 
-- AWS EC2 instance with NVIDIA GPU (A10G, L4, A100)
+- AWS EC2 instance with an NVIDIA GPU (A10G, L4, A100)
 - Ubuntu 22.04+ AMI (Deep Learning AMI recommended)
 - Python 3.11+
 - CUDA 12.x + cuDNN
 
-## Instance Recommendations
+## Instance recommendations
 
-| Instance | GPU | VRAM | Max model size | Cost profile |
-| --- | --- | --- | --- | --- |
-| `g5.xlarge` | A10G | 24 GB | 7B models | Cost-effective |
-| `g5.2xlarge` | A10G | 24 GB | 7B models (+ CPU offload) | Good for 7B |
-| `g4dn.xlarge` | T4 | 16 GB | 2B-3B models | Cheap option |
-| `p3.2xlarge` | V100 | 16 GB | 2B-3B models | Legacy |
+| Instance | GPU | VRAM | Comfortable model size |
+| --- | --- | --- | --- |
+| `g5.xlarge` | A10G | 24 GB | 7B |
+| `g5.2xlarge` | A10G | 24 GB | 7B (+ CPU offload headroom) |
+| `g4dn.xlarge` | T4 | 16 GB | 2B–3B |
+| `p3.2xlarge` | V100 | 16 GB | 2B–3B |
 
 ## Installation
 
 ```bash
-# Update system
-sudo apt update && sudo apt upgrade -y
+sudo apt update && sudo apt install -y python3.11 python3.11-venv git
 
-# Install Python and git
-sudo apt install -y python3.11 python3.11-venv git
+git clone git@github.com:egesabanci/awq.git
+cd awq
 
-# Clone the repo
-git clone git@github.com:egesabanci/awq-qwen-experiment.git
-cd awq-qwen-experiment
-
-# Create venv and install
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -e ".[dev]"
 ```
 
-### Verify Installation
+### Verify installation
 
 ```bash
-# Check CUDA
-python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0)}')"
-
-# Check CLI
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
 python -m awq --help
 ```
 
-## Running the Pipeline
+## Running the pipeline
 
-### Download a Model
+### Get a model
 
-The pipeline auto-downloads models from HuggingFace. First run will cache
-the model:
-
-```bash
-python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('Qwen/Qwen3.5-2B')"
-```
-
-Or download to a specific directory:
+`awq` accepts a Hugging Face repo ID or a local directory. To pin a local copy:
 
 ```bash
-huggingface-cli download Qwen/Qwen3.5-2B --local-dir /data/models/Qwen3.5-2B
+huggingface-cli download Qwen/Qwen3-1.7B --local-dir /data/models/Qwen3-1.7B
 ```
 
-### Run Full Pipeline
+### Full pipeline
 
 ```bash
 python -m awq run \
-  --model Qwen/Qwen3.5-2B \
+  --model /data/models/Qwen3-1.7B \
   --dataset wikitext \
-  --output-dir /data/results/awq-experiment \
+  --output-dir /data/out/qwen17 \
   --device cuda \
-  --batch-size 16 \
   --samples 128 \
-  --eval-samples 50 \
-  --group-size 32
+  --batch-size 8 \
+  --max-length 2048 \
+  --group-size 32 \
+  --quantize-strategy all
 ```
 
-### Run Individual Steps
+### Individual steps
 
 ```bash
 # Calibrate
-python -m awq calibrate \
-  --model Qwen/Qwen3.5-2B \
-  --dataset wikitext \
-  --output /data/results/stats.pt \
-  --device cuda \
-  --batch-size 16
+python -m awq calibrate --model /data/models/Qwen3-1.7B \
+  --dataset wikitext --output /data/out/stats.pt --device cuda \
+  --batch-size 8 --samples 128 --max-length 2048
 
-# Scales
-python -m awq scales \
-  --model Qwen/Qwen3.5-2B \
-  --calibration-stats /data/results/stats.pt \
-  --output /data/results/scales.pt
+# Scales (per-layer α grid search)
+python -m awq scales --model /data/models/Qwen3-1.7B \
+  --calibration-stats /data/out/stats.pt --output /data/out/scales.pt \
+  --group-size 32 --quantize-strategy all
 
-# Quantize (always on CPU for memory safety)
-python -m awq quantize \
-  --model Qwen/Qwen3.5-2B \
-  --scales /data/results/scales.pt \
-  --output-dir /data/results/quantized
-
-# Benchmark
-python -m awq benchmark \
-  --model Qwen/Qwen3.5-2B \
-  --awq-dir /data/results/quantized \
-  --output /data/results/comparison.json \
-  --device cuda \
-  --eval-samples 50
+# Quantize (CPU, memory-safe) + verify
+python -m awq quantize --model /data/models/Qwen3-1.7B \
+  --scales /data/out/scales.pt --output-dir /data/out/awq \
+  --group-size 32 --verify-layers 3
 ```
 
-## Memory Tuning
+There is no `benchmark`/eval step — quality comparison is out of scope. To
+inspect generation quality, use `awq.inference.load_awq_model` from a Python
+shell (dequantized-FP16; see [inference.md](inference.md)).
+
+## Memory tuning
 
 | GPU VRAM | Suggested `--batch-size` | Suggested `--samples` |
 | --- | --- | --- |
-| 16 GB | 4-8 | 64-128 |
-| 24 GB | 8-16 | 128 |
-| 40 GB+ | 16-32 | 128-256 |
+| 16 GB | 4–8 | 64–128 |
+| 24 GB | 8–16 | 128 |
+| 40 GB+ | 16–32 | 128–256 |
 
 If you hit OOM:
 
-1. Reduce `--batch-size` (most impactful)
-2. Reduce `--max-length` from 2048 to 1024
-3. Reduce `--samples` from 128 to 64
-4. Use `--group-size 128` instead of 32 (faster, coarser quantization)
+1. Reduce `--batch-size` (most impactful — clears cache more often).
+2. Reduce `--max-length` from 2048 to 1024.
+3. Reduce `--samples` from 128 to 64.
+4. Use `--group-size 128` instead of 32 (coarser, faster quantization).
 
-## Large Model Notes
+> Note: `--batch-size` controls cache-clear cadence, not real batching (each
+> sample is forwarded individually). See [calibration.md](calibration.md).
 
-For 7B+ models:
+## Large-model notes
 
-- Calibration: expect ~14 GB VRAM at batch_size=8
-- Benchmark: expect ~16 GB VRAM for dual model loading
-- Consider using `AWQModelWrapper` for memory-efficient inference
-- The `--quantize-strategy last_only` may work better on large models
+- Calibration loads the full FP16 model on the GPU. A 7B model ≈ 14 GB FP16.
+- `awq run` loads the model for calibrate, frees it, then re-loads for scales.
+- Quantization is CPU and streams `safetensors` one tensor at a time — it does
+  not need the GPU.
+- `--quantize-strategy last_only` / `alternating` keep some layers in FP16 if
+  you want a mixed-precision artifact.
 
-## Data Transfer
+## Portability
 
-Results are fully portable between EC2 and local macOS:
+Artifacts are plain `.pt`/`.json` and move freely between EC2 and a laptop:
 
 ```bash
-# From EC2 to local
-scp -i ~/.ssh/key.pem ubuntu@<ip>:/data/results/comparison.json ./results/
-
-# Analyze locally
-python -c "import json; r = json.load(open('results/comparison.json')); print(r['evaluation']['per_metric'])"
+scp -i ~/.ssh/key.pem ubuntu@<ip>:/data/out/awq/quantized_state.pt ./
 ```
 
 ## Troubleshooting
 
 | Problem | Cause | Solution |
 | --- | --- | --- |
-| `CUDA out of memory` | VRAM exhausted | Reduce `--batch-size` or `--max-length` |
+| `CUDA out of memory` | VRAM exhausted | Reduce `--batch-size` / `--max-length` / `--samples`. |
 | `No module named 'awq'` | Not installed | `pip install -e .` |
-| `model.safetensors.index.json not found` | Sharded model | The pipeline handles both sharded and single-file |
-| HuggingFace download timeout | Slow network | Use `--model /path/to/local/model` with pre-downloaded weights |
-| `AssertionError: Scales dict is empty` | No layers matched | Check `--quantize-strategy` and model architecture |
+| `model.safetensors.index.json not found` | Sharded model | `awq` handles both sharded and single-file `safetensors`. |
+| HuggingFace download timeout | Slow network | Pre-download and pass `--model /path/to/local`. |
+| `ScaleError: 0 scales` | No layers matched | Check `--quantize-strategy` and that the model's linears are named `model.layers.{i}.*`. |
