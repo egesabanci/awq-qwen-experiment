@@ -313,3 +313,181 @@ class TestInference:
         assert deq_weight.shape == (32, 64)
         mse = (weight - deq_weight).pow(2).mean().item()
         assert mse < 0.02, f"MSE too high: {mse}"
+
+
+class TestAwqCorrectness:
+    """Regression tests for the three core AWQ algorithm-correctness bugs.
+
+    Bug 1: AWQ scale direction (weight scaled UP before quant, divided after).
+    Bug 2: scale search uses the weight (grid search over alpha).
+    Bug 3: verify_reconstruction uses the full dequant (includes 1/s).
+    """
+
+    def test_awq_direction_protects_salient_channel(self):
+        """Bug 1: correct direction (W*s, /s) must beat inverted (W/s, *s)
+        on activation-weighted error for a salient channel."""
+        from awq.scales import compute_awq_scale, _pseudo_quantize_int4
+
+        torch.manual_seed(2)
+        d_out, d_in = 8, 64
+        W = torch.randn(d_out, d_in) * 0.05
+        s_x = torch.full((d_in,), 0.05)
+        s_x[0] = 3.0  # channel 0 is salient
+
+        s = compute_awq_scale(W, s_x, grid_search=True, group_size=32)
+
+        # Correct direction (what the pipeline now does)
+        err_correct = (((W - _pseudo_quantize_int4(W * s, 32) / s) ** 2)
+                       * s_x).sum().item()
+        # Inverted direction (the old bug)
+        err_inverted = (((W - _pseudo_quantize_int4(W / s, 32) * s) ** 2)
+                        * s_x).sum().item()
+
+        assert err_correct < err_inverted, (
+            f"Correct direction should be better: {err_correct} vs {err_inverted}")
+
+    def test_grid_search_beats_rtn(self):
+        """Bug 2: grid search uses the weight and never does worse than RTN."""
+        from awq.scales import compute_awq_scale, _pseudo_quantize_int4
+
+        torch.manual_seed(5)
+        d_out, d_in = 32, 64
+        W = torch.randn(d_out, d_in) * 0.05  # small weights: RTN is lossy
+        s_x = torch.rand(d_in) + 0.01
+        s_x[0] = 5.0  # a salient channel
+
+        s = compute_awq_scale(W, s_x, grid_search=True, group_size=32)
+
+        def weighted_err(scale):
+            w_hat = _pseudo_quantize_int4(W * scale, 32) / scale
+            return (((W - w_hat) ** 2) * s_x).sum().item()
+
+        err_best = weighted_err(s)
+        err_rtn = weighted_err(torch.ones(d_in))  # alpha=0, no scaling
+
+        assert err_best <= err_rtn, (
+            f"Grid search should beat RTN: {err_best} vs {err_rtn}")
+
+    def test_compute_awq_scale_uses_weight(self):
+        """Bug 2: scales must depend on the weight, not just activations."""
+        from awq.scales import compute_awq_scale
+
+        torch.manual_seed(4)
+        s_x = torch.rand(64) * 2 + 0.1
+        s_x[0] = 5.0
+        W_small = torch.randn(32, 64) * 0.02   # tiny weights
+        W_large = torch.randn(32, 64) * 2.0     # large weights
+
+        s_small = compute_awq_scale(W_small, s_x, grid_search=True, group_size=32)
+        s_large = compute_awq_scale(W_large, s_x, grid_search=True, group_size=32)
+
+        # With the old code (weight ignored) these were identical; the search
+        # over the weight's quantization error must now differentiate them.
+        assert not torch.allclose(s_small, s_large, atol=1e-3), (
+            "Scales should differ when weights differ (weight must be used)")
+
+    def test_dequantize_layer_roundtrip_nonidentity(self):
+        """Bug 3 / consistency: dequant must invert quant with non-identity scales.
+
+        If dequantize_layer forgot the 1/s back-apply, this MSE would blow up."""
+        from awq.inference import dequantize_layer
+        from awq.quantize import quantize_layer_cpu
+
+        torch.manual_seed(3)
+        W = torch.randn(16, 64, dtype=torch.float16)
+        s = torch.linspace(0.5, 2.0, 64, dtype=torch.float16)
+
+        q = quantize_layer_cpu(W, s, group_size=32)
+        W_hat = dequantize_layer(q).float()
+
+        mse = (W.float() - W_hat).pow(2).mean().item()
+        # Missing 1/s would give MSE ~ ||W - Q(W*s)||^2 ≈ 0.25 here; correct is
+        # the INT4 quant error (~0.02-0.03 in fp16). 0.05 cleanly separates them.
+        assert mse < 0.05, f"Round-trip MSE too high (dequant missing 1/s?): {mse}"
+
+    def test_verify_reconstruction_uses_full_dequant(self, tmp_path):
+        """Bug 3: verify_reconstruction must report quant error, not scale magnitude.
+
+        Old code dequantized via _dequantize_group (no 1/s) and compared against
+        W, yielding MSE ~ ||W - Q(W*s)|| which is dominated by the scale factor.
+        With the fix it uses dequantize_layer (includes 1/s) → small MSE.
+        """
+        from safetensors.torch import save_file
+        from awq.quantize import quantize_layer_cpu, verify_reconstruction
+
+        torch.manual_seed(7)
+        d_out, d_in = 16, 64
+        W = torch.randn(d_out, d_in, dtype=torch.float16)
+        s = torch.linspace(0.5, 2.0, d_in, dtype=torch.float16)
+
+        name = "model.layers.0.mlp.gate_proj.weight"
+        save_file({name: W}, str(tmp_path / "model.safetensors"))
+
+        q = quantize_layer_cpu(W, s, group_size=32)
+        key = "model.layers.0.mlp.gate_proj"
+        errors = verify_reconstruction({key: q}, str(tmp_path), num_layers=1)
+
+        assert key in errors
+        # Old (buggy) verify reported ~0.3-1.0 here; correct quant error is tiny.
+        assert errors[key] < 0.05, (
+            f"verify MSE too high (missing 1/s back-apply?): {errors[key]}")
+
+
+class TestPipelineRobustness:
+    """Regression tests for the bugs found during the real-model test run.
+
+    T11: build_skip_set must be model-agnostic (derive layer count from stats).
+    T5/T6: compute_all_scales must surface failures and raise on 0 layers.
+    """
+
+    @staticmethod
+    def _stats(n_layers, proj="mlp.gate_proj"):
+        return {f"model.layers.{i}.{proj}": torch.zeros(64) for i in range(n_layers)}
+
+    def test_build_skip_set_alternating_28_layers(self):
+        # T11: must not be hardcoded to 24 layers.
+        from awq.scales import build_skip_set
+        stats = self._stats(28)
+        skips = build_skip_set(stats, quantize_strategy="alternating")
+        assert "model.layers.0.mlp.gate_proj" in skips   # even
+        assert "model.layers.1.mlp.gate_proj" not in skips  # odd
+        assert "model.layers.26.mlp.gate_proj" in skips   # even, beyond old 24 cap
+        assert "model.layers.27.mlp.gate_proj" not in skips  # odd, beyond old 24 cap
+
+    def test_build_skip_set_last_only_28_layers(self):
+        from awq.scales import build_skip_set
+        stats = self._stats(28)
+        skips = build_skip_set(stats, quantize_strategy="last_only")
+        # first half (0..13) skipped, last half (14..27) quantized
+        assert "model.layers.0.mlp.gate_proj" in skips
+        assert "model.layers.13.mlp.gate_proj" in skips
+        assert "model.layers.14.mlp.gate_proj" not in skips
+        assert "model.layers.27.mlp.gate_proj" not in skips
+
+    def test_build_skip_set_tiny_proj_derives_layer_count(self):
+        # T11: tiny-projection skips should cover all detected layers, not just 0..23.
+        from awq.scales import build_skip_set
+        stats = {f"model.layers.{i}.linear_attn.in_proj_a": torch.zeros(8)
+                 for i in range(28)}
+        skips = build_skip_set(stats, skip_tiny_projections=True)
+        assert "model.layers.27.linear_attn.in_proj_a" in skips  # beyond old 24 cap
+
+    def test_compute_all_scales_raises_on_zero_layers(self):
+        # T5/T6: a silent "0 layers" success must become a loud error.
+        from awq.scales import compute_all_scales
+        from utils.errors import ScaleError
+        model = torch.nn.Sequential()
+        model.add_module("real_name", torch.nn.Linear(8, 4))
+        stats = {"nonexistent_layer": torch.zeros(8)}  # matches no model linear
+        with pytest.raises(ScaleError):
+            compute_all_scales(model, stats, skip_set=set(), grid_search=False, verbose=False)
+
+    def test_compute_all_scales_succeeds_on_match(self):
+        from awq.scales import compute_all_scales
+        model = torch.nn.Sequential()
+        model.add_module("lin", torch.nn.Linear(8, 4))
+        stats = {"lin": torch.rand(8) * 2 + 0.1}
+        scales = compute_all_scales(model, stats, skip_set=set(),
+                                    grid_search=False, verbose=False)
+        assert "lin" in scales
+        assert scales["lin"].shape == (8,)

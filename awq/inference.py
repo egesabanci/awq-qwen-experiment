@@ -14,40 +14,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.memory import log_memory, memory_tracker, get_device, empty_cache
-
-
-def dequantize_layer(q: dict) -> torch.Tensor:
-    """Dequantize a full quantized layer to FP16.
-
-    Args:
-        q: Quantized layer dict with keys:
-            'packed_weights', 'group_scales', 'scale_factors', 'shape', 'group_size'
-
-    Returns:
-        FP16 weight matrix of shape [d_out, d_in].
-    """
-    d_out, d_in = q["shape"]
-    group_size = q["group_size"]
-
-    parts = []
-    for packed, qscale in zip(q["packed_weights"], q["group_scales"]):
-        # Unpack two INT4 per INT8
-        low = (packed & 0x0F).to(torch.int8)
-        high = ((packed >> 4) & 0x0F).to(torch.int8)
-        low = torch.where(low > 7, low - 16, low)
-        high = torch.where(high > 7, high - 16, high)
-
-        w_deq = torch.stack([low, high], dim=-1).reshape(d_out, group_size)
-        w_deq = w_deq.to(dtype=torch.float16) * qscale.to(dtype=torch.float16)
-        parts.append(w_deq)
-
-    w = torch.cat(parts, dim=1)[:, :d_in]
-
-    # Multiply back by AWQ scale factors to restore original weight space
-    s = q["scale_factors"].to(dtype=torch.float16)
-    w = w * s.unsqueeze(0)
-
-    return w
+from awq.quantize import dequantize_layer  # canonical dequant (shared with verify)
 
 
 def load_awq_model(
@@ -68,17 +35,14 @@ def load_awq_model(
     if device is None:
         device = get_device()
 
-    print(f"Loading FP16 model shell from {model_path}...")
-    device_map = "auto" if device == "cuda" else device
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map=device_map,
-        trust_remote_code=False,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # Load the FP16 model shell via the shared loader, then overwrite linear
+    # weights with dequantized AWQ ones.
+    # NOTE: this is dequantized-FP16 inference (no INT4 kernel) — peak memory is
+    # ~one full FP16 model, not the INT4 footprint. For true memory-efficiency
+    # use AWQModelWrapper (on-the-fly dequant), which is not wired into the
+    # generation path.
+    from awq.models import load_model
+    model, tokenizer = load_model(model_path, device)
 
     print(f"Loading quantized weights from {quantized_path}...")
     quantized_state = torch.load(quantized_path, map_location="cpu", weights_only=True)
@@ -165,13 +129,14 @@ class AWQModelWrapper:
         input_len = inputs["input_ids"].size(1)
 
         t0 = time.perf_counter()
-        outputs = self.model.generate(
-            **inputs,
+        gen_kwargs = dict(
             max_new_tokens=max_new_tokens,
             do_sample=temperature > 0,
-            temperature=temperature if temperature > 0 else None,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
+        if temperature > 0:
+            gen_kwargs["temperature"] = temperature
+        outputs = self.model.generate(**inputs, **gen_kwargs)
         elapsed = time.perf_counter() - t0
 
         generated = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)

@@ -147,8 +147,10 @@ def limit_memory(fraction: float = 0.7, device: str | None = None) -> None:
 
     if device == "mps" and torch.backends.mps.is_available():
         torch.mps.set_per_process_memory_fraction(fraction)
-        max_mem = torch.mps.recommended_max_memory()
-        print(f"[MEM] MPS limited to {fraction:.0%} = {max_mem / 1e9:.1f} GB")
+        recommended = torch.mps.recommended_max_memory()
+        cap = recommended * fraction
+        print(f"[MEM] MPS limited to {fraction:.0%} ≈ {cap / 1e9:.1f} GB "
+              f"(of {recommended / 1e9:.1f} GB recommended max)")
     elif device == "cuda":
         try:
             torch.cuda.set_per_process_memory_fraction(fraction)

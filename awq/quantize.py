@@ -108,9 +108,13 @@ def quantize_layer_cpu(
     """
     d_out, d_in = weight.shape
 
-    # Apply AWQ scaling: W' = W / s
+    # AWQ scaling: scale salient weight channels UP before quantization
+    # (W' = W * s) so they occupy more of the INT4 range; the inverse (1/s) is
+    # applied at dequantization time. Activations would be divided by s at
+    # inference, but here that is folded into the stored weight, so the
+    # dequantized weight is Q(W * s) / s ≈ W.
     s = scale_factors.to(dtype=weight.dtype)
-    w_scaled = weight / s.unsqueeze(0)
+    w_scaled = weight * s.unsqueeze(0)
 
     # Group-wise INT4 quantization
     packed_groups: list[torch.Tensor] = []
@@ -203,10 +207,16 @@ def quantize_all_layers(
         q = quantize_layer_cpu(weight, scale, group_size=group_size)
         quantized_state[calib_key] = q
 
-        # Stats
+        # Stats — count the FULL INT4 footprint: packed weights (uint8/byte)
+        # plus per-group FP16 scales plus per-channel AWQ scale factors (FP16).
+        # Ignoring the scale metadata overstates the compression ratio.
         d_out, d_in = q["shape"]
         fp16_bytes = d_out * d_in * 2
-        quantized_bytes = sum(p.numel() for p in q["packed_weights"])
+        quantized_bytes = (
+            sum(p.numel() * p.element_size() for p in q["packed_weights"])       # packed int4
+            + sum(s.numel() * s.element_size() for s in q["group_scales"])        # per-group fp16 scales
+            + q["scale_factors"].numel() * q["scale_factors"].element_size()       # per-channel AWQ scales
+        )
         total_fp16_bytes += fp16_bytes
         total_quantized_bytes += quantized_bytes
 
@@ -218,8 +228,8 @@ def quantize_all_layers(
         del weight, q
         gc.collect()
 
+    total_ratio = total_fp16_bytes / max(total_quantized_bytes, 1)
     if verbose:
-        total_ratio = total_fp16_bytes / max(total_quantized_bytes, 1)
         print(f"\n  ── Compression Summary ──")
         print(f"  Layers quantized: {len(quantized_state)}")
         print(f"  FP16 total:  {total_fp16_bytes / 1e6:.1f} MB")
@@ -249,6 +259,48 @@ def quantize_all_layers(
     return quantized_state
 
 
+def dequantize_layer(q: dict) -> torch.Tensor:
+    """Dequantize a full quantized layer back to FP16 weights.
+
+    Inverts ``quantize_layer_cpu``: the stored INT4 encodes ``W * s`` (AWQ
+    scales weights UP before quantization), so the group-dequantized tensor is
+    divided by ``s`` to recover ``W ≈ Q(W * s) / s``.
+
+    This is the single canonical dequantization path, shared by both
+    ``verify_reconstruction`` and ``awq.inference.load_awq_model`` so that
+    verification measures the same error inference actually incurs.
+
+    Args:
+        q: Quantized layer dict with keys 'packed_weights', 'group_scales',
+            'scale_factors', 'shape', 'group_size'.
+
+    Returns:
+        FP16 weight matrix of shape [d_out, d_in].
+    """
+    d_out, d_in = q["shape"]
+    group_size = q["group_size"]
+
+    parts = []
+    for packed, qscale in zip(q["packed_weights"], q["group_scales"]):
+        # Unpack two INT4 per INT8 (two's-complement low nibble convention)
+        low = (packed & 0x0F).to(torch.int8)
+        high = ((packed >> 4) & 0x0F).to(torch.int8)
+        low = torch.where(low > 7, low - 16, low)
+        high = torch.where(high > 7, high - 16, high)
+
+        w_deq = torch.stack([low, high], dim=-1).reshape(d_out, group_size)
+        w_deq = w_deq.to(dtype=torch.float16) * qscale.to(dtype=torch.float16)
+        parts.append(w_deq)
+
+    w = torch.cat(parts, dim=1)[:, :d_in]
+
+    # Invert the AWQ scale: stored = Q(W * s), so W ≈ dequant / s
+    s = q["scale_factors"].to(dtype=torch.float16)
+    w = w / s.unsqueeze(0)
+
+    return w
+
+
 def verify_reconstruction(
     quantized_state: dict[str, dict],
     model_path: str,
@@ -271,19 +323,14 @@ def verify_reconstruction(
             break
 
         q = quantized_state[calib_key]
-        d_out, d_in = q["shape"]
-        group_size = q["group_size"]
 
         # Load original weight
         fp16_weight = load_weight_from_safetensors(sf_path, tensor_name).float()
 
-        # Dequantize
-        deq_parts: list[torch.Tensor] = []
-        for packed, qscale in zip(q["packed_weights"], q["group_scales"]):
-            w_deq = _dequantize_group(packed, qscale, d_out, group_size)
-            deq_parts.append(w_deq)
-
-        deq_weight = torch.cat(deq_parts, dim=1)[:, :d_in]
+        # Dequantize using the SAME path as inference (includes AWQ 1/s).
+        # Using _dequantize_group alone (without the 1/s back-apply) would
+        # compare W against Q(W*s) and report scale magnitude, not quant error.
+        deq_weight = dequantize_layer(q).float()
 
         mse = (fp16_weight - deq_weight).pow(2).mean().item()
         errors[calib_key] = mse

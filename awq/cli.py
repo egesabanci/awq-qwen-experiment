@@ -47,7 +47,6 @@ Examples:
   python -m awq calibrate --model Qwen/Qwen3.5-2B --dataset c4 --output-dir results
   python -m awq scales --model Qwen/Qwen3.5-2B --calibration-stats results/stats.pt
   python -m awq quantize --model Qwen/Qwen3.5-2B --scales results/scales.pt
-  python -m awq benchmark --model Qwen/Qwen3.5-2B --awq-dir results/awq/
   python -m awq run --model Qwen/Qwen3.5-2B --dataset c4 --output-dir results/
 """,
     )
@@ -58,7 +57,7 @@ Examples:
     calib = subparsers.add_parser("calibrate", help="Run calibration pass")
     calib.add_argument("--model", required=True, help="Model path or HF repo ID")
     calib.add_argument("--dataset", default="wikitext",
-                       choices=["wikitext", "c4", "toolace"],
+                       choices=["wikitext", "c4"],
                        help="Calibration dataset")
     calib.add_argument("--output", default="results/calibration_stats.pt",
                        help="Output path for calibration stats")
@@ -81,12 +80,18 @@ Examples:
     scales.add_argument("--output", default="results/awq_scales.pt",
                         help="Output path for scale factors")
     scales.add_argument("--alpha", type=float, default=0.5,
-                        help="AWQ scaling strength (default: 0.5)")
+                       help="AWQ scaling strength (used only with --no-grid-search)")
+    scales.add_argument("--group-size", type=int, default=32,
+                       help="INT4 group size; must match `awq quantize` (default: 32)")
+    scales.add_argument("--no-grid-search", action="store_true",
+                       help="Disable per-layer alpha grid search; use --alpha instead")
     scales.add_argument("--quantize-strategy", default="alternating",
                         choices=["all", "alternating", "last_only", "first_only"],
                         help="Which layers to quantize (default: alternating)")
     scales.add_argument("--no-skip-lm-head", action="store_true",
                         help="Include lm_head in quantization")
+    scales.add_argument("--device", default=None,
+                        help="Device (auto-detected if omitted)")
     scales.add_argument("--quiet", action="store_true",
                         help="Suppress progress output")
 
@@ -103,54 +108,30 @@ Examples:
     quant.add_argument("--quiet", action="store_true",
                        help="Suppress progress output")
 
-    # ── benchmark ───────────────────────────────────────────────────
-    bench = subparsers.add_parser("benchmark",
-                                   help="Run FP16 + AWQ comparison")
-    bench.add_argument("--model", required=True, help="Model path or HF repo ID")
-    bench.add_argument("--awq-dir", default="results/awq_quantized",
-                       help="Directory with quantized model")
-    bench.add_argument("--output", default="results/comparison.json",
-                       help="Output path for comparison results")
-    bench.add_argument("--dataset", default="toolace",
-                       choices=["toolace", "wikitext"],
-                       help="Evaluation dataset")
-    bench.add_argument("--eval-samples", type=int, default=10,
-                       help="Number of evaluation samples")
-    bench.add_argument("--max-new-tokens", type=int, default=256,
-                       help="Max new tokens per generation")
-    bench.add_argument("--device", default=None,
-                       help="Device (auto-detected if omitted)")
-    bench.add_argument("--quiet", action="store_true",
-                       help="Suppress progress output")
-
     # ── run ──────────────────────────────────────────────────────────
     run = subparsers.add_parser("run", help="Run full pipeline end-to-end")
     run.add_argument("--model", required=True, help="Model path or HF repo ID")
     run.add_argument("--dataset", default="wikitext",
-                     choices=["wikitext", "c4", "toolace"],
+                     choices=["wikitext", "c4"],
                      help="Calibration dataset")
     run.add_argument("--output-dir", default="results",
                      help="Output directory for all artifacts")
     run.add_argument("--samples", type=int, default=128,
                      help="Number of calibration samples")
-    run.add_argument("--eval-samples", type=int, default=10,
-                     help="Number of evaluation samples")
     run.add_argument("--batch-size", type=int, default=5,
                      help="Calibration batch size")
     run.add_argument("--max-length", type=int, default=2048,
                      help="Max sequence length")
-    run.add_argument("--max-new-tokens", type=int, default=256,
-                     help="Max new tokens per generation")
     run.add_argument("--group-size", type=int, default=32,
                      help="INT4 group size")
     run.add_argument("--alpha", type=float, default=0.5,
-                     help="AWQ scaling strength")
+                     help="AWQ scaling strength (used only with --no-grid-search)")
+    run.add_argument("--no-grid-search", action="store_true",
+                     help="Disable per-layer alpha grid search; use --alpha instead")
     run.add_argument("--quantize-strategy", default="alternating",
                      choices=["all", "alternating", "last_only", "first_only"])
     run.add_argument("--device", default=None,
                      help="Device (auto-detected if omitted)")
-    run.add_argument("--skip-benchmark", action="store_true",
-                     help="Skip the benchmark step after quantization")
     run.add_argument("--quiet", action="store_true",
                      help="Suppress progress output")
 
@@ -167,15 +148,15 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     prompts = _load_calibration_prompts(args.dataset, args.samples)
 
     # Load model
-    from eval.runner import load_fp16_model
-    from utils.memory import limit_memory, device as dev_util
+    from awq.models import load_model
+    from utils.memory import limit_memory, get_device
 
     if device is None:
-        device = dev_util.get_device()
+        device = get_device()
     if device == "mps":
         limit_memory(0.7, device)
 
-    model, tokenizer = load_fp16_model(args.model, device)
+    model, tokenizer = load_model(args.model, device)
     from utils.memory import log_memory
     log_memory("after_model_load", device)
 
@@ -205,11 +186,11 @@ def cmd_scales(args: argparse.Namespace) -> int:
     calibration_stats = require_calibration_stats(args.calibration_stats)
 
     # Load model (for weight d_in dimensions)
-    from eval.runner import load_fp16_model
-    from utils.memory import device as dev_util
+    from awq.models import load_model
+    from utils.memory import get_device
 
-    device = args.device or dev_util.get_device()
-    model, _ = load_fp16_model(args.model, device)
+    device = args.device or get_device()
+    model, _ = load_model(args.model, device)
 
     # Compute scales
     from awq.scales import compute_all_scales, build_skip_set
@@ -227,6 +208,8 @@ def cmd_scales(args: argparse.Namespace) -> int:
         output_path=args.output,
         verbose=verbose,
         skip_set=skip_set,
+        group_size=args.group_size,
+        grid_search=not args.no_grid_search,
     )
 
     print(f"\n✅ Scale computation complete. {len(scales)} layers → {args.output}")
@@ -264,37 +247,6 @@ def cmd_quantize(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_benchmark(args: argparse.Namespace) -> int:
-    """Execute the benchmark subcommand."""
-    verbose = not args.quiet
-    device = args.device
-
-    # Load evaluation data
-    print(f"Loading evaluation data ({args.eval_samples} samples from {args.dataset})...")
-    prompts, expected = _load_eval_data(args.dataset, args.eval_samples)
-
-    # Validate AWQ directory
-    from utils.errors import require_quantized_dir
-
-    awq_state_path = require_quantized_dir(args.awq_dir)
-
-    # Run comparison
-    from eval.benchmark import run_awq_comparison
-
-    comparison = run_awq_comparison(
-        fp16_model_path=args.model,
-        awq_quantized_path=awq_state_path,
-        prompts=prompts,
-        expected=expected,
-        output_path=args.output,
-        max_new_tokens=args.max_new_tokens,
-        device=device,
-    )
-
-    print(f"\n✅ Benchmark complete → {args.output}")
-    return 0
-
-
 def cmd_run(args: argparse.Namespace) -> int:
     """Execute the full pipeline.
 
@@ -302,8 +254,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         1. Prepare calibration data
         2. Run calibration pass
         3. Compute AWQ scales
-        4. Quantize model
-        5. (Optional) Run benchmark comparison
+        4. Quantize model (with reconstruction verification)
     """
     verbose = not args.quiet
     device = args.device
@@ -315,7 +266,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     calib_stats_path = os.path.join(output_dir, "calibration_stats.pt")
     scales_path = os.path.join(output_dir, "awq_scales.pt")
     quantized_dir = os.path.join(output_dir, "awq_quantized")
-    comparison_path = os.path.join(output_dir, "comparison.json")
 
     print("=" * 60)
     print("AWQ FULL PIPELINE")
@@ -339,15 +289,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     print("STEP 2/4 — Calibration pass")
     print("─" * 60)
 
-    from eval.runner import load_fp16_model
-    from utils.memory import limit_memory, device as dev_util, log_memory
+    from awq.models import load_model
+    from utils.memory import limit_memory, get_device, log_memory
 
     if device is None:
-        device = dev_util.get_device()
+        device = get_device()
     if device == "mps":
         limit_memory(0.7, device)
 
-    model, tokenizer = load_fp16_model(args.model, device)
+    model, tokenizer = load_model(args.model, device)
     log_memory("after_model_load", device)
 
     from awq.calibrate import run_calibration
@@ -376,7 +326,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     calib = require_calibration_stats(calib_stats_path)
 
     # Re-load model for weight dimensions
-    model, _ = load_fp16_model(args.model, device)
+    model, _ = load_model(args.model, device)
 
     from awq.scales import compute_all_scales, build_skip_set
 
@@ -391,6 +341,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         output_path=scales_path,
         verbose=verbose,
         skip_set=skip_set,
+        group_size=args.group_size,
+        grid_search=not args.no_grid_search,
     )
     del model
     empty_cache()
@@ -421,33 +373,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"  Average MSE: {avg_mse:.8f}")
 
     print(f"\n  ✓ Quantized model → {quantized_dir}\n")
-
-    # ── Step 5: Benchmark (optional) ─────────────────────────────────
-    if not args.skip_benchmark:
-        print("─" * 60)
-        print("STEP 5/5 — Benchmark comparison")
-        print("─" * 60)
-
-        eval_prompts, eval_expected = _load_eval_data(args.dataset, args.eval_samples)
-
-        from utils.errors import require_quantized_dir
-
-        awq_state_path = require_quantized_dir(quantized_dir)
-
-        from eval.benchmark import run_awq_comparison
-
-        comparison = run_awq_comparison(
-            fp16_model_path=args.model,
-            awq_quantized_path=awq_state_path,
-            prompts=eval_prompts,
-            expected=eval_expected,
-            output_path=comparison_path,
-            max_new_tokens=args.max_new_tokens,
-            device=device,
-        )
-        print(f"\n  ✓ Comparison results → {comparison_path}")
-    else:
-        print("  (benchmark skipped via --skip-benchmark)")
 
     print()
     print("=" * 60)
@@ -487,48 +412,8 @@ def _load_calibration_prompts(dataset: str, n_samples: int) -> list[str]:
             "Use 'wikitext' instead."
         )
 
-    elif dataset == "toolace":
-        from data.loader import load_toolace_splits, format_prompt
-
-        calib_samples, _ = load_toolace_splits(
-            calibration_size=n_samples, eval_size=0, seed=42
-        )
-        return [format_prompt(s) for s in calib_samples]
-
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
-
-
-def _load_eval_data(dataset: str, n_samples: int) -> tuple[list[str], list[dict]]:
-    """Load and format evaluation prompts with expected outputs."""
-    if dataset == "wikitext":
-        from datasets import load_dataset
-
-        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-        texts = [s["text"] for s in ds if s["text"].strip()]
-        prompts = texts[:n_samples]
-        # No expected tool calls for generic text
-        expected = [{"name": "", "arguments": {}} for _ in prompts]
-        return prompts, expected
-
-    elif dataset == "toolace":
-        from data.loader import load_toolace_splits, format_prompt, extract_expected_tool_calls
-
-        _, eval_samples = load_toolace_splits(
-            calibration_size=0, eval_size=n_samples, seed=42
-        )
-        prompts = [format_prompt(s) for s in eval_samples]
-        expected = [extract_expected_tool_calls(s) for s in eval_samples]
-        # Flatten expected (take first tool call per sample)
-        flat_expected = []
-        for exp_list in expected:
-            if exp_list and len(exp_list) > 0:
-                flat_expected.append(exp_list[0])
-            else:
-                flat_expected.append({"name": "", "arguments": {}})
-        return prompts, flat_expected
-
-    raise ValueError(f"Unknown dataset: {dataset}")
 
 
 # ── Entry point ─────────────────────────────────────────────────────
@@ -557,8 +442,6 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_scales(args)
         elif args.command == "quantize":
             return cmd_quantize(args)
-        elif args.command == "benchmark":
-            return cmd_benchmark(args)
         elif args.command == "run":
             return cmd_run(args)
         else:
